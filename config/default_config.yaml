@@ -1,0 +1,52 @@
+# Tennis Shot Prediction Configuration
+# This file contains default training and model parameters
+
+# Model Configuration
+model:
+  type: "player_aware"  # Options: "player_aware", "context_only"
+  embed_dim: 64
+  player_dim: 64
+  n_head: 4
+  n_cycles: 3
+  seq_len: 30
+  dropout: 0.1
+
+# Training Configuration
+training:
+  batch_size: 64
+  epochs: 10
+  learning_rate: 1e-3
+  weight_decay: 1e-2
+  focal_gamma: 2.0
+  class_weight_power: 0.3
+  
+# Data Configuration
+data:
+  max_seq_len: 30
+  test_size: 0.2
+  random_state: 42
+  num_workers: 2
+
+# Scheduler Configuration
+scheduler:
+  type: "OneCycleLR"
+  max_lr: 1e-3
+  pct_start: 0.3
+  div_factor: 25
+  final_div_factor: 1000
+
+# Paths (to be updated for your system)
+paths:
+  points_path: "/path/to/charting-points.csv"
+  matches_path: "/path/to/charting-matches.csv"
+  atp_path: "/path/to/atp_players.csv"
+  wta_path: "/path/to/wta_players.csv"
+  output_dir: "./checkpoints"
+
+# Device Configuration
+device: "auto"  # Options: "auto", "cpu", "cuda"
+
+# Logging
+logging:
+  level: "INFO"
+  save_logs: true
