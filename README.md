@@ -1,53 +1,92 @@
-# Tennis Shot Prediction
+# Tennis Shot Prediction Repository
 
-A deep learning project for predicting tennis shot locations using transformer-based neural networks. This project analyzes tennis match data to predict where players will hit their next shot based on rally context, player characteristics, and match conditions.
+A comprehensive, modular repository for predicting tennis shots using transformer-based neural networks and memory-augmented baselines. This repository transforms complex tennis match data into actionable predictions using state-of-the-art deep learning approaches.
 
-## 📊 Project Overview
+## 🎾 Features
 
-This project implements state-of-the-art transformer models to predict tennis shot placement with the following features:
+- **Multiple Model Architectures**: Transformer models (player-aware & context-only) plus MSS-GAN B1 baseline
+- **Robust Data Processing**: Handles Tennis Abstract Notation with data augmentation
+- **Memory-Augmented Learning**: MSS-GAN with episodic and semantic memory systems
+- **Comprehensive Evaluation**: Multiple metrics including tactical intelligence analysis
+- **Production Ready**: Modular design with proper error handling and logging
 
-- **Player-aware modeling**: Incorporates player embeddings for personalized predictions
-- **Context-sensitive predictions**: Considers court surface, score, handedness, and serve type
-- **Data augmentation**: Left/right mirroring for improved generalization
-- **Focal loss**: Handles class imbalance in shot zone distribution
-- **Comprehensive evaluation**: Multi-metric analysis including tactical intelligence
-
-## 🏗️ Project Structure
+## 🗂️ Repository Structure
 
 ```
 Tennis-Shot-Prediction/
 ├── src/
-│   ├── data/
-│   │   ├── __init__.py
-│   │   ├── dataset.py          # Dataset classes for loading tennis data
-│   │   └── utils.py            # Data utilities and metrics
-│   ├── models/
-│   │   ├── __init__.py
-│   │   └── models.py           # Neural network models
-│   ├── utils/
-│   │   └── __init__.py         # General utilities
-│   └── __init__.py
-├── scripts/
-│   ├── train.py                # Training script
-│   ├── evaluate.py             # Evaluation script
-│   └── predict.py              # Inference script
-├── config/
-│   ├── default_config.yaml     # Default configuration
-│   ├── atp_config.yaml         # ATP-specific settings
-│   └── wta_config.yaml         # WTA-specific settings
-├── notebooks/
-│   └── fds-tennis.ipynb        # Original research notebook
-├── checkpoints/                # Model checkpoints
-├── tests/                      # Unit tests
-├── requirements.txt
-├── setup.py
-├── LICENSE
-└── README.md
+│   ├── data/           # Data loading and processing
+│   ├── models/         # Neural network models (Transformers + MSS-GAN)
+│   └── utils/          # Utility functions
+├── scripts/            # Training and evaluation scripts
+├── notebooks/          # Jupyter notebooks and demos
+├── config/             # Configuration files
+├── checkpoints/        # Saved model weights
+├── docs/              # Documentation
+└── tests/             # Unit tests
 ```
+
+## 📊 Models
+
+### 1. Transformer Models
+- **SymbolicTinyRM_PlayerAware**: Includes player embeddings for personalized predictions
+- **SymbolicTinyRM_Context**: Context-only model without player-specific information
+
+### 2. MSS-GAN B1 Baseline  
+- **Memory Systems**: Episodic (binary tree LSTM) + Semantic (learnable matrix)
+- **GAN Architecture**: Generator-discriminator setup for realistic shot generation
+- **Categorical Output**: Direct zone and shot type prediction
 
 ## 🚀 Quick Start
 
 ### Installation
+
+```bash
+git clone https://github.com/yourusername/Tennis-Shot-Prediction.git
+cd Tennis-Shot-Prediction
+pip install -r requirements.txt
+```
+
+### Basic Usage
+
+```python
+from src.data import MCPTennisDataset
+from src.models import SymbolicTinyRM_PlayerAware, MSSGAN_B1_Trainer
+
+# Load tennis data
+dataset = MCPTennisDataset(
+    points_path='data/points.csv',
+    matches_path='data/matches.csv', 
+    atp_players_path='data/atp_players.csv',
+    wta_players_path='data/wta_players.csv'
+)
+
+# Train transformer model
+model = SymbolicTinyRM_PlayerAware(
+    zone_vocab_size=len(dataset.zone_vocab),
+    type_vocab_size=len(dataset.shot_vocab),
+    num_players=len(dataset.player_vocab)
+)
+
+# Or train MSS-GAN baseline
+trainer = MSSGAN_B1_Trainer(dataset=dataset)
+trainer.train(epochs=20)
+```
+
+## 🛠️ Training Scripts
+
+### Transformer Models
+```bash
+python scripts/train_model.py --model player_aware --epochs 50
+python scripts/train_model.py --model context_only --epochs 50
+```
+
+### MSS-GAN Baseline
+```bash
+python scripts/train_mssgan_b1.py
+```
+
+### Installation Requirements
 
 1. Clone the repository:
 ```bash
