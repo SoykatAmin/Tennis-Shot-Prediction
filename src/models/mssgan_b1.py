@@ -7,7 +7,8 @@ from typing import List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
+import numpy as np
 
 # ---------------------------
 # Utility modules
@@ -239,156 +240,400 @@ class MSSGAN_B1_Trainer:
                  n_zones=11, n_types=11,
                  embed_dim=256, latent_dim=64,
                  em_N=1100, em_l=3, sm_b=80):
+
         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
         self.dataset = dataset
-        # model components
-        self.encoder = StepEncoder(n_zones=n_zones, n_types=n_types, emb_dim=64, ctx_dim=6, hidden=embed_dim).to(self.device)
-        self.EM = EpisodicMemory(dim=embed_dim, mem_len=em_N, extract_depth=em_l).to(self.device)
-        self.SM = SemanticMemory(dim=embed_dim, b=sm_b).to(self.device)
-        self.G = GeneratorCategorical(cdim=embed_dim, latent_dim=latent_dim, n_zones=n_zones, n_types=n_types).to(self.device)
-        self.D = DiscriminatorCategorical(n_zones=n_zones, n_types=n_types, ctx_dim=6, emb_dim=64, hidden=512).to(self.device)
+        
+        # --- Model Components ---
+        self.encoder = StepEncoder(
+            n_zones=n_zones, n_types=n_types,
+            emb_dim=64, ctx_dim=6, hidden=embed_dim
+        ).to(self.device)
 
-        # optimizers
-        g_params = list(self.encoder.parameters()) + list(self.G.parameters()) + list(self.SM.parameters())
+        self.EM = EpisodicMemory(
+            dim=embed_dim, mem_len=em_N, extract_depth=em_l
+        ).to(self.device)
+
+        self.SM = SemanticMemory(
+            dim=embed_dim, b=sm_b
+        ).to(self.device)
+
+        self.G = GeneratorCategorical(
+            cdim=embed_dim, latent_dim=latent_dim,
+            n_zones=n_zones, n_types=n_types
+        ).to(self.device)
+
+        self.D = DiscriminatorCategorical(
+            n_zones=n_zones, n_types=n_types,
+            ctx_dim=6, emb_dim=64, hidden=512
+        ).to(self.device)
+
+        # Optimizers
+        g_params = list(self.encoder.parameters()) \
+                 + list(self.G.parameters()) \
+                 + list(self.SM.parameters())
+
         d_params = list(self.D.parameters())
-        self.optG = torch.optim.Adam(g_params, lr=2e-4, betas=(0.5, 0.999))
-        self.optD = torch.optim.Adam(d_params, lr=2e-4, betas=(0.5, 0.999))
 
-        # losses
+        self.optG = torch.optim.Adam(g_params, lr=2e-4, betas=(0.5, 0.999))
+        self.optD = torch.optim.Adam(d_params, lr=5e-5, betas=(0.5, 0.999))
+
+        # Losses
         self.bce = nn.BCELoss()
-        self.ce = nn.CrossEntropyLoss(ignore_index=0)  # ignore pad if present
+        self.ce = nn.CrossEntropyLoss(ignore_index=0)
         self.latent_dim = latent_dim
 
+    # -------------------------------------------------------------
+    # Flatten a batch of sequences into per-shot supervised tuples
+    # -------------------------------------------------------------
     def _flatten_batch_steps(self, batch):
-        # batch: list/dict from Dataset: each item has x_zone (T), x_type (T), context (6), y_target (T)
-        # Convert to flattened per-step tensors:
-        zones = []
-        types = []
-        ctxs = []
-        tgt_zones = []
-        tgt_types = []
+        zones, types, ctxs, tgt_zones, tgt_types = [], [], [], [], []
+        
         for item in batch:
-            x_zone = item['x_zone'].numpy() if isinstance(item['x_zone'], torch.Tensor) else item['x_zone']
-            x_type = item['x_type'].numpy() if isinstance(item['x_type'], torch.Tensor) else item['x_type']
-            y_target = item['y_target'].numpy() if isinstance(item['y_target'], torch.Tensor) else item['y_target']
-            ctx = item['context'].unsqueeze(0).numpy() if isinstance(item['context'], torch.Tensor) else item['context']
-            T = len(x_zone)
-            for i in range(T):
-                if x_zone[i] == 0:  # padded position
-                    continue
-                # target zone for that shot is y_target[i] (may be 0 if missing)
-                if y_target[i] == 0:
-                    continue
-                zones.append(int(x_zone[i]))
-                types.append(int(x_type[i]))
-                ctxs.append(ctx.reshape(-1))
-                tgt_zones.append(int(y_target[i]))
-                tgt_types.append(int(x_type[i]))  # we treat true shot type label as x_type at same index
-        if len(zones) == 0:
-            return None
-        zones_t = torch.tensor(zones, dtype=torch.long)
-        types_t = torch.tensor(types, dtype=torch.long)
-        ctxs_t = torch.tensor(ctxs, dtype=torch.float32)
-        tgt_zones_t = torch.tensor(tgt_zones, dtype=torch.long)
-        tgt_types_t = torch.tensor(tgt_types, dtype=torch.long)
-        return zones_t, types_t, ctxs_t, tgt_zones_t, tgt_types_t
+            x_zone = item['x_zone'].cpu().numpy()
+            x_type = item['x_type'].cpu().numpy()
+            y_target = item['y_target'].cpu().numpy()
+            ctx = item['context'].cpu().numpy()
+            
+            # Ensure context is 1D
+            if len(ctx.shape) > 1: ctx = ctx.squeeze()
 
-    def train(self, epochs=10, batch_size=32, dataloader_workers=2):
-        loader = DataLoader(self.dataset, batch_size=batch_size, shuffle=True,
-                            num_workers=dataloader_workers, collate_fn=lambda b: b)
+            T = len(x_zone)
+            
+            # CRITICAL FIX: Iterate to T-1 so we can get the NEXT shot type
+            for i in range(T - 1):
+                cur_zone = x_zone[i]
+                next_zone = y_target[i]
+                cur_type = x_type[i]
+                next_type = x_type[i + 1] # <--- The Correct Target
+                
+                # Skip padding (0)
+                if cur_zone == 0 or next_zone == 0 or next_type == 0:
+                    continue
+                
+                zones.append(int(cur_zone))
+                types.append(int(cur_type))
+                ctxs.append(ctx)
+                tgt_zones.append(int(next_zone))
+                tgt_types.append(int(next_type)) 
+        
+        if len(zones) == 0: return None
+        
+        # Wrap ctxs in np.array() to fix the "slow conversion" warning
+        return (torch.tensor(zones, dtype=torch.long), 
+                torch.tensor(types, dtype=torch.long),
+                torch.tensor(np.array(ctxs), dtype=torch.float32), 
+                torch.tensor(tgt_zones, dtype=torch.long),
+                torch.tensor(tgt_types, dtype=torch.long)
+               )
+
+    # -------------------------------------------------------------
+    # VALIDATION
+    # -------------------------------------------------------------
+    @torch.no_grad()
+    def _validate_epoch(self, loader):
+
+        self.G.eval()
+        self.D.eval()
+        self.EM.eval()
+
+        total_loss = 0.0
+        correct_type = 0
+        correct_zone = 0
+        total_items = 0
+
+        for batch in loader:
+            flat = self._flatten_batch_steps(batch)
+            if flat is None: 
+                continue
+
+            zones_t, types_t, ctxs_t, tgt_zones_t, tgt_types_t = [
+                x.to(self.device) for x in flat
+            ]
+
+            c_t = self.encoder(zones_t, types_t, ctxs_t)
+            mEM = self.EM.read(c_t)
+            if not isinstance(mEM, torch.Tensor):
+                mEM = torch.zeros_like(c_t)
+
+            mSM = self.SM.read(c_t)
+
+            z = torch.randn(zones_t.size(0), self.latent_dim, device=self.device)
+
+            _, type_logits, zone_probs, type_probs = self.G(c_t, mEM, mSM, z)
+
+            loss = self.ce(type_logits, tgt_types_t)
+            total_loss += loss.item()
+
+            pred_type = torch.argmax(type_probs, dim=1)
+            pred_zone = torch.argmax(zone_probs, dim=1)
+
+            correct_type += (pred_type == tgt_types_t).sum().item()
+            correct_zone += (pred_zone == tgt_zones_t).sum().item()
+            total_items += tgt_types_t.size(0)
+
+        avg_loss = total_loss / (len(loader) if len(loader) > 0 else 1)
+        acc_type = (correct_type / total_items * 100) if total_items > 0 else 0
+        acc_zone = (correct_zone / total_items * 100) if total_items > 0 else 0
+
+        return {
+            "loss": avg_loss,
+            "acc": acc_zone,     # for logger
+            "zone_acc": acc_zone,
+            "type_acc": acc_type
+        }
+
+    # -------------------------------------------------------------
+    # FULL TRAINING LOOP
+    # -------------------------------------------------------------
+    def train_full(self, epochs=10, batch_size=32, dataloader_workers=2):
+
+        total_len = len(self.dataset)
+        train_len = int(0.8 * total_len)
+        val_len = total_len - train_len
+
+        train_ds, val_ds = random_split(
+            self.dataset,
+            [train_len, val_len],
+            generator=torch.Generator().manual_seed(42)
+        )
+
+        print(f"Train Samples: {train_len} | Val Samples: {val_len}")
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=dataloader_workers,
+            collate_fn=lambda b: b
+        )
+
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=dataloader_workers,
+            collate_fn=lambda b: b
+        )
+
+        # MAIN TRAINING LOOP
         for ep in range(1, epochs + 1):
-            total_d_loss = 0.0
-            total_g_loss = 0.0
-            cnt = 0
-            for batch in loader:
+
+            self.G.train()
+            self.D.train()
+            self.EM.train()
+
+            train_cls_loss_sum = 0.0
+            steps = 0
+
+            for batch in train_loader:
+
                 flat = self._flatten_batch_steps(batch)
                 if flat is None:
                     continue
-                zones_t, types_t, ctxs_t, tgt_zones_t, tgt_types_t = flat
-                zones_t = zones_t.to(self.device)
-                types_t = types_t.to(self.device)
-                ctxs_t = ctxs_t.to(self.device)
-                tgt_zones_t = tgt_zones_t.to(self.device)
-                tgt_types_t = tgt_types_t.to(self.device)
 
-                B = zones_t.size(0)
-                # Encoder: get c_t (no recurrence over history is used here)
-                c_t = self.encoder(zones_t, types_t, ctxs_t, h_prev=None)  # B x hidden
+                zones_t, types_t, ctxs_t, tgt_zones_t, tgt_types_t = [
+                    x.to(self.device) for x in flat
+                ]
 
-                # EM read (may be empty early in training)
-                mEM = self.EM.read(c_t.to(self.device))  # B x hidden (on device)
-                if isinstance(mEM, torch.Tensor):
-                    mEM = mEM.to(self.device)
-                else:
+                # --- ENCODER + MEMORY ---
+                c_t = self.encoder(zones_t, types_t, ctxs_t)
+                mEM = self.EM.read(c_t)
+                if not isinstance(mEM, torch.Tensor):
                     mEM = torch.zeros_like(c_t)
+                mSM = self.SM.read(c_t)
 
-                # SM read
-                mSM = self.SM.read(c_t)  # B x hidden
-
-                # -------------------------
-                # Discriminator update
-                # -------------------------
+                # ===============================
+                #   TRAIN DISCRIMINATOR
+                # ===============================
                 self.optD.zero_grad()
-                # Real: build one-hot vectors for true targets
+
                 n_zones = self.G.zone_head.out_features
                 n_types = self.G.type_head.out_features
-                real_zone_oh = F.one_hot(tgt_zones_t.clamp(min=0), num_classes=n_zones).float().to(self.device)
-                real_type_oh = F.one_hot(tgt_types_t.clamp(min=0), num_classes=n_types).float().to(self.device)
 
-                # D on real
-                real_adv, real_logits = self.D(None, None, real_zone_oh, real_type_oh, ctxs_t)
-                valid = torch.ones_like(real_adv)
-                loss_real = self.bce(real_adv, valid)
+                real_zone_oh = F.one_hot(tgt_zones_t, num_classes=n_zones).float()
+                real_type_oh = F.one_hot(tgt_types_t, num_classes=n_types).float()
+
+                real_adv, real_logits = self.D(
+                    None, None,
+                    real_zone_oh, real_type_oh, ctxs_t
+                )
+
+                z = torch.randn(zones_t.size(0), self.latent_dim, device=self.device)
+                _, _, zone_probs_fake, type_probs_fake = self.G(c_t, mEM, mSM, z)
+
+                fake_adv, _ = self.D(
+                    None, None,
+                    zone_probs_fake.detach(),
+                    type_probs_fake.detach(),
+                    ctxs_t
+                )
+
+                loss_real = self.bce(real_adv, torch.ones_like(real_adv))
+                loss_fake = self.bce(fake_adv, torch.zeros_like(fake_adv))
                 loss_cls_real = self.ce(real_logits, tgt_types_t)
-
-                # Fake: generate
-                z = torch.randn(B, self.latent_dim, device=self.device)
-                zone_logits_fake, type_logits_fake, zone_probs_fake, type_probs_fake = self.G(c_t, mEM, mSM, z)
-                fake_zone = zone_probs_fake.detach()  # treat as input probabilities
-                fake_type = type_probs_fake.detach()
-                fake_adv, fake_logits = self.D(None, None, fake_zone, fake_type, ctxs_t)
-                fake_label = torch.zeros_like(fake_adv)
-                loss_fake = self.bce(fake_adv, fake_label)
 
                 lossD = loss_real + loss_fake + 0.5 * loss_cls_real
                 lossD.backward()
                 self.optD.step()
 
-                # -------------------------
-                # Generator + encoder update
-                # -------------------------
+                # ===============================
+                #   TRAIN GENERATOR
+                # ===============================
                 self.optG.zero_grad()
-                # recompute generator outputs to get gradients through G & encoder
-                z2 = torch.randn(B, self.latent_dim, device=self.device)
-                zone_logits_fake2, type_logits_fake2, zone_probs_fake2, type_probs_fake2 = self.G(c_t, mEM, mSM, z2)
-                fake_adv2, fake_logits2 = self.D(None, None, zone_probs_fake2, type_probs_fake2, ctxs_t)
-                valid2 = torch.ones_like(fake_adv2)
-                lossG_gan = self.bce(fake_adv2, valid2)
-                # generator classification loss: encourage generated type to match true type
+
+                z2 = torch.randn(zones_t.size(0), self.latent_dim, device=self.device)
+                zone_logits_fake2, type_logits_fake2, zone_probs_fake2, type_probs_fake2 = \
+                    self.G(c_t, mEM, mSM, z2)
+
+                fake_adv2, _ = self.D(
+                    None, None,
+                    zone_probs_fake2,
+                    type_probs_fake2,
+                    ctxs_t
+                )
+
+                lossG_gan = self.bce(fake_adv2, torch.ones_like(fake_adv2))
                 lossG_cls = self.ce(type_logits_fake2, tgt_types_t)
                 lossG = lossG_gan + 0.5 * lossG_cls
+
                 lossG.backward()
                 self.optG.step()
 
-                # -------------------------
-                # Memory updates
-                # -------------------------
-                # append c_t to EM (store on CPU to save GPU mem)
+                train_cls_loss_sum += lossG_cls.item()
+                steps += 1
+
+                # --- UPDATE MEMORIES ---
                 for i in range(c_t.size(0)):
-                    self.EM.append(c_t[i:i+1].detach().cpu())  # shape (1, dim)
-                # update SM from mEM (use mEM as obtained earlier)
+                    self.EM.append(c_t[i:i+1].detach().cpu())
                 try:
                     self.SM.update(mEM.detach().cpu())
-                except Exception:
+                except:
                     pass
 
-                total_d_loss += lossD.item()
-                total_g_loss += lossG.item()
-                cnt += 1
+            avg_train_loss = train_cls_loss_sum / max(1, steps)
 
-            avg_d = total_d_loss / max(1, cnt)
-            avg_g = total_g_loss / max(1, cnt)
-            print(f"Epoch {ep}/{epochs} — D_loss: {avg_d:.4f}, G_loss: {avg_g:.4f}")
+            # VALIDATION
+            val_metrics = self._validate_epoch(val_loader)
+            if "acc" not in val_metrics:
+                val_metrics["acc"] = 0.0
+
+            print(
+                f"Epoch {ep}/{epochs} | "
+                f"Train Loss: {avg_train_loss:.4f} | "
+                f"Val Loss: {val_metrics['loss']:.4f} | "
+                f"Acc: {val_metrics['acc']:.2f}%"
+            )
+
+        torch.save(self.G.state_dict(), "mssgan_tennis_model.pth")
+        print("Model weights saved to mssgan_tennis_model.pth")
+        
+    def train_full_strict(self, epochs=10, batch_size=32, dataloader_workers=2):
+        """
+        Strict implementation of Fernando et al. (2019) Joint Training.
+        Ref: Section 4, Equation 21.
+        """
+        # 1. Split Dataset (80/20)
+        total_len = len(self.dataset)
+        train_len = int(0.8 * total_len)
+        val_len = total_len - train_len
+        train_ds, val_ds = random_split(self.dataset, [train_len, val_len], 
+                                        generator=torch.Generator().manual_seed(42))
+        
+        print(f"Train Samples: {train_len} | Val Samples: {val_len}")
+        print(f"Mode: Strict Joint Training (SS-GAN Objective)")
+        
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, 
+                                  num_workers=dataloader_workers, collate_fn=lambda b: b)
+        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, 
+                                num_workers=dataloader_workers, collate_fn=lambda b: b)
+
+        # Hyperparameter from Paper Eq 21 (lambda_eta)
+        # We set it to 1.0 to ensure classification is as important as fooling D
+        lambda_cls = 1.0 
+
+        for ep in range(1, epochs + 1):
+            self.G.train(); self.D.train(); self.EM.train()
+            train_cls_loss_sum = 0.0
+            steps = 0
+            
+            for batch in train_loader:
+                flat = self._flatten_batch_steps(batch)
+                if flat is None: continue
+                zones_t, types_t, ctxs_t, tgt_zones_t, tgt_types_t = [x.to(self.device) for x in flat]
+                
+                # --- Encoder & Memory ---
+                c_t = self.encoder(zones_t, types_t, ctxs_t, h_prev=None)
+                mEM = self.EM.read(c_t)
+                if not isinstance(mEM, torch.Tensor): mEM = torch.zeros_like(c_t)
+                mSM = self.SM.read(c_t)
+
+                # ====================================================
+                # 1. TRAIN DISCRIMINATOR (Joint Objective)
+                # ====================================================
+                self.optD.zero_grad()
+                n_zones, n_types = self.G.zone_head.out_features, self.G.type_head.out_features
+                
+                # Real Data terms
+                real_zone_oh = F.one_hot(tgt_zones_t.clamp(min=0), num_classes=n_zones).float()
+                real_type_oh = F.one_hot(tgt_types_t.clamp(min=0), num_classes=n_types).float()
+                real_adv, real_logits = self.D(None, None, real_zone_oh, real_type_oh, ctxs_t)
+                
+                # Fake Data terms
+                z = torch.randn(zones_t.size(0), self.latent_dim, device=self.device)
+                _, _, zone_probs_fake, type_probs_fake = self.G(c_t, mEM, mSM, z)
+                fake_adv, _ = self.D(None, None, zone_probs_fake.detach(), type_probs_fake.detach(), ctxs_t)
+                
+                # D Losses (Eq 21: Maximize log D(x) + log(1 - D(G(z))) + Supervised)
+                # Note: BCE minimizes -log, so it matches the Maximize objective
+                loss_real = self.bce(real_adv, torch.ones_like(real_adv) * 0.9) # Label smoothing
+                loss_fake = self.bce(fake_adv, torch.zeros_like(fake_adv))
+                loss_cls_real = self.ce(real_logits, tgt_types_t)
+                
+                lossD = loss_real + loss_fake + (lambda_cls * loss_cls_real)
+                lossD.backward()
+                self.optD.step()
+
+                # ====================================================
+                # 2. TRAIN GENERATOR (Joint Objective)
+                # ====================================================
+                self.optG.zero_grad()
+                
+                # Re-generate
+                z2 = torch.randn(zones_t.size(0), self.latent_dim, device=self.device)
+                zone_logits_fake2, type_logits_fake2, zone_probs_fake2, type_probs_fake2 = self.G(c_t, mEM, mSM, z2)
+                
+                fake_adv2, _ = self.D(None, None, zone_probs_fake2, type_probs_fake2, ctxs_t)
+                
+                # G Losses (Eq 21: Maximize log D(G(z)) + Supervised)
+                lossG_gan = self.bce(fake_adv2, torch.ones_like(fake_adv2))
+                lossG_cls = self.ce(type_logits_fake2, tgt_types_t)
+                
+                lossG = lossG_gan + (lambda_cls * lossG_cls)
+                lossG.backward()
+                self.optG.step()
+                
+                train_cls_loss_sum += lossG_cls.item()
+                steps += 1
+
+                # --- Memory Update ---
+                for i in range(c_t.size(0)):
+                    self.EM.append(c_t[i:i+1].detach().cpu())
+                try: self.SM.update(mEM.detach().cpu())
+                except: pass
+
+            avg_train_loss = train_cls_loss_sum / max(1, steps)
+            val_metrics = self._validate_epoch(val_loader)
+            if 'acc' not in val_metrics: val_metrics['acc'] = 0.0
+            
+            print(f"Epoch {ep}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {val_metrics['loss']:.4f} | Acc: {val_metrics['acc']:.2f}%")
+
+        torch.save(self.G.state_dict(), "mssgan_tennis_model_strict.pth")
+        print("Model weights saved to mssgan_tennis_model_strict.pth")
+
+    def train(self, epochs=10, batch_size=32, dataloader_workers=2):
+        """Legacy training method - calls train_full for compatibility"""
+        return self.train_full(epochs=epochs, batch_size=batch_size, dataloader_workers=dataloader_workers)
 
     @torch.no_grad()
     def evaluate(self, batch_size=64):
@@ -467,3 +712,28 @@ class MSSGAN_B1_Trainer:
         print(f"{label} Confusion Matrix:")
         print(cm)
         print()
+
+
+# ---------------------------
+# Example usage
+# ---------------------------
+if __name__ == "__main__":
+    # Example usage - uncomment and modify as needed
+    # from src.data import MCPTennisDataset
+    # 
+    # dataset = MCPTennisDataset(
+    #     points_path='path/to/points.csv',
+    #     matches_path='path/to/matches.csv', 
+    #     atp_players_path='path/to/atp_players.csv',
+    #     wta_players_path='path/to/wta_players.csv',
+    #     max_seq_len=30
+    # )
+    # 
+    # trainer = MSSGAN_B1_Trainer(
+    #     dataset=dataset, 
+    #     device='cuda' if torch.cuda.is_available() else 'cpu'
+    # )
+    # 
+    # # Use strict joint training (recommended)
+    # trainer.train_full_strict(epochs=10, batch_size=512, dataloader_workers=0)
+    pass

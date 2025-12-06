@@ -77,9 +77,9 @@ def main():
     print(f"  Batch size: {batch_size}")
     print(f"  Workers: {dataloader_workers}")
     
-    # Start training
-    print("🎾 Starting MSS-GAN B1 training...")
-    trainer.train(
+    # Start training with improved approach
+    print("🎾 Starting MSS-GAN B1 training with strict joint objective...")
+    trainer.train_full_strict(
         epochs=epochs,
         batch_size=batch_size,
         dataloader_workers=dataloader_workers

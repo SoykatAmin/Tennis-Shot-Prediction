@@ -65,14 +65,32 @@ trainer = MSSGAN_B1_Trainer(
     n_types=len(dataset.shot_vocab)
 )
 
-# Train the model
-trainer.train(epochs=20, batch_size=32)
+# Train with strict joint objective (recommended)
+trainer.train_full_strict(epochs=20, batch_size=32)
+
+# Or use basic training
+trainer.train_full(epochs=20, batch_size=32)
 
 # Evaluate
 trainer.evaluate()
 ```
 
-### Using the Training Script
+## Training Methods
+
+### 1. Basic Training (`train_full`)
+- Standard GAN training with classification loss
+- 80/20 train/validation split
+- Real-time validation monitoring
+
+### 2. Strict Joint Training (`train_full_strict`) **[Recommended]**
+- Implements Fernando et al. (2019) joint objective (Equation 21)
+- Balanced adversarial and classification objectives
+- Label smoothing for improved stability
+- Better convergence properties
+
+### 3. Legacy Training (`train`)
+- Maintained for backward compatibility
+- Calls `train_full` internally
 
 ```bash
 # Update data paths in scripts/train_mssgan_b1.py
@@ -95,6 +113,10 @@ python scripts/train_mssgan_b1.py
 2. **Adversarial Training**: GAN setup helps generate realistic shot sequences
 3. **Categorical Output**: Directly predicts zone and shot type distributions
 4. **Context Awareness**: Incorporates match context (surface, score, etc.)
+5. **Improved Target Labeling**: Fixed next-shot prediction logic
+6. **Proper Validation**: Real-time monitoring with comprehensive metrics
+7. **Joint Training Objective**: Strict implementation of SS-GAN methodology
+8. **Label Smoothing**: Enhanced training stability
 
 ## Performance Metrics
 
