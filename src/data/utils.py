@@ -2,6 +2,7 @@
 Data utilities and helper functions for tennis shot prediction.
 """
 
+import os
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
@@ -9,7 +10,16 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 from typing import Tuple, List, Dict
+from pathlib import Path
+import sys
 
+# Ensure src/models is on sys.path (expects this file at src/data/utils.py)
+_models_path = Path(__file__).resolve().parent.parent / "models"
+_models_path_str = str(_models_path)
+if _models_path_str not in sys.path:
+    sys.path.insert(0, _models_path_str)
+
+from models import UnifiedShotLSTM, RichInputLSTM, SimpleMultiHeadBaseline, HierarchicalCristianGPT, SimpleUnifiedBaseline
 
 def create_data_loaders(
     dataset, 
