@@ -11,7 +11,9 @@ from .models import (
     RichInputLSTM,
     SimpleMultiHeadBaseline,
     HierarchicalCristianGPT,
-    SimpleUnifiedBaseline
+    SimpleUnifiedBaseline,
+    HybridRichLSTM,
+    UnifiedCristianGPT
 )
 from .mssgan_b1 import (
     MSSGAN_B1_Trainer,
@@ -28,7 +30,9 @@ from .utils import (
     load_multi_baseline_model,
     load_hierarchical_checkpoint,
     load_checkpoint_single_baseline,
-    load_singlehead_baseline
+    load_singlehead_baseline,
+    load_hybrid_model_checkpoint,
+    load_UnifiedCristianGPT_checkpoint
 )
 
 __all__ = [
@@ -44,6 +48,8 @@ __all__ = [
     'SimpleMultiHeadBaseline',
     'HierarchicalCristianGPT',
     'SimpleUnifiedBaseline',
+    'HybridRichLSTM',
+    'UnifiedCristianGPT',
     
     # MSS-GAN components
     'MSSGAN_B1_Trainer',
@@ -59,19 +65,8 @@ __all__ = [
     'load_rich_lstm',
     'load_multi_baseline_model',
     'load_hierarchical_checkpoint',
-    'load_checkpoint_single_baseline'
-]
-
-__all__ = [
-    'SymbolicTinyRM_PlayerAware',
-    'SymbolicTinyRM_Context',
-    'FocalLoss',
-    'create_model',
-    'MSSGAN_B1_Trainer',
-    'MLP',
-    'EpisodicMemory', 
-    'SemanticMemory',
-    'StepEncoder',
-    'GeneratorCategorical',
-    'DiscriminatorCategorical'
+    'load_checkpoint_single_baseline',
+    'load_singlehead_baseline',
+    'load_hybrid_model_checkpoint',
+    'load_UnifiedCristianGPT_checkpoint'
 ]

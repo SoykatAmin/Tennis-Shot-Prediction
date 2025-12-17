@@ -632,3 +632,137 @@ class SimpleUnifiedBaseline(nn.Module):
         # Predict
         logits = self.net(x_in) # [B, L, Vocab_Size]
         return logits
+    
+
+class HybridRichLSTM(nn.Module):
+    def __init__(self, 
+                 num_players,        # For Player Embeddings
+                 type_vocab_size,    # Size of type vocab (e.g. ~20: f, b, s, ...)
+                 dir_vocab_size,     # Size of direction vocab (e.g. 4: 1, 2, 3)
+                 depth_vocab_size,   # Size of depth vocab (e.g. 4: 7, 8, 9)
+                 context_dim=10, 
+                 hidden_dim=256, 
+                 num_layers=2, 
+                 dropout=0.2):
+        super().__init__()
+
+        # --- 1. Rich Input Embeddings (Same as RichInputLSTM) ---
+        self.emb_type = nn.Embedding(type_vocab_size, 64, padding_idx=0)
+        self.emb_dir  = nn.Embedding(dir_vocab_size, 16, padding_idx=0)
+        self.emb_depth= nn.Embedding(depth_vocab_size, 16, padding_idx=0)
+        
+        # Player Style Embeddings
+        self.emb_player = nn.Embedding(num_players, 32, padding_idx=0)
+        
+        # Context Projection
+        self.context_fc = nn.Linear(context_dim, 32)
+
+        # Total Input Dimension: 64+16+16 + 32+32 + 32 = 192
+        lstm_input_dim = 64 + 16 + 16 + 32 + 32 + 32
+
+        # --- 2. Shared Backbone ---
+        self.lstm = nn.LSTM(
+            input_size=lstm_input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout
+        )
+
+        # --- 3. Parallel Output Heads ---
+        # Instead of predicting one Unified ID, we predict the components separately
+        self.head_type  = nn.Linear(hidden_dim, type_vocab_size)
+        self.head_dir   = nn.Linear(hidden_dim, dir_vocab_size)
+        self.head_depth = nn.Linear(hidden_dim, depth_vocab_size)
+
+    def forward(self, x_type, x_dir, x_depth, x_s_id, x_r_id, x_context):
+        # A. Create Rich Embeddings
+        e_t = self.emb_type(x_type)
+        e_d = self.emb_dir(x_dir)
+        e_p = self.emb_depth(x_depth)
+        
+        # Expand Player & Context vectors to sequence length
+        # [Batch, 1, Dim] -> [Batch, Seq, Dim]
+        e_s = self.emb_player(x_s_id).unsqueeze(1).expand(-1, e_t.size(1), -1)
+        e_r = self.emb_player(x_r_id).unsqueeze(1).expand(-1, e_t.size(1), -1)
+        e_ctx = self.context_fc(x_context).unsqueeze(1).expand(-1, e_t.size(1), -1)
+        
+        # B. Concatenate All Features
+        full_input = torch.cat([e_t, e_d, e_p, e_s, e_r, e_ctx], dim=-1)
+        
+        # C. Pass through Shared LSTM
+        lstm_out, _ = self.lstm(full_input)
+        
+        # D. Split into Parallel Heads
+        logits_type  = self.head_type(lstm_out)
+        logits_dir   = self.head_dir(lstm_out)
+        logits_depth = self.head_depth(lstm_out)
+        
+        return logits_type, logits_dir, logits_depth
+
+class UnifiedCristianGPT(nn.Module):
+    def __init__(self, unified_vocab_size, num_players, context_dim=10, 
+                 embed_dim=128, n_head=4, n_cycles=3, seq_len=30):        
+        super().__init__()
+        
+        # 1. Embeddings
+        # We embed the Unified Token directly
+        self.token_emb = nn.Embedding(unified_vocab_size, embed_dim)
+        
+        # Player Embeddings (Static Style)
+        self.player_emb = nn.Embedding(num_players, 64)
+        
+        # Context Fusion
+        self.context_fusion = nn.Sequential(
+            nn.Linear(context_dim + (64 * 2), embed_dim), 
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim)
+        )
+        
+        # Input = Token_Emb + Context_Emb
+        self.input_dim = embed_dim # We sum them or concat? Let's Add.
+        
+        self.pos_emb = nn.Parameter(torch.randn(1, seq_len, embed_dim))
+        
+        # Transformer
+        self.blocks = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_head, dim_feedforward=embed_dim*4,
+            batch_first=True, norm_first=True, dropout=0.1
+        )
+        self.transformer = nn.TransformerEncoder(self.blocks, num_layers=n_cycles)
+        self.norm_f = nn.LayerNorm(embed_dim)
+        
+        # Single Output Head
+        self.head = nn.Linear(embed_dim, unified_vocab_size)
+
+    def generate_causal_mask(self, sz):
+        return torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1).to(DEVICE)
+    
+    def forward(self, x_seq, x_c, x_s, x_r):
+        # x_seq: [Batch, Seq] -> [Batch, Seq, Dim]
+        tok = self.token_emb(x_seq)
+        
+        # Players
+        s = self.player_emb(x_s)
+        r = self.player_emb(x_r)
+        
+        # Context: [Batch, CtxDim] -> [Batch, Dim]
+        c_vec = torch.cat([x_c, s, r], dim=1)
+        c_emb = self.context_fusion(c_vec)
+        
+        # Expand Context to Sequence Length
+        # [Batch, 1, Dim] -> [Batch, Seq, Dim]
+        c_emb = c_emb.unsqueeze(1).expand(-1, tok.size(1), -1)
+        
+        # Combine: Token + Context + Position
+        # We ADD context to the token embedding (ResNet style) rather than concat
+        x = tok + c_emb + self.pos_emb[:, :tok.size(1), :]
+        
+        # Causal Mask
+        mask = torch.triu(torch.full((x.size(1), x.size(1)), float('-inf')), diagonal=1).to(x.device)
+        
+        # Transformer
+        x = self.transformer(x, mask=mask)
+        x = self.norm_f(x)
+        
+        return self.head(x)

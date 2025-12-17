@@ -10,7 +10,7 @@ from pathlib import Path
 import sys
 
 # Import models directly from their files to avoid circular imports
-from .models import UnifiedShotLSTM, RichInputLSTM, SimpleMultiHeadBaseline, HierarchicalCristianGPT, SimpleUnifiedBaseline
+from .models import UnifiedShotLSTM, RichInputLSTM, SimpleMultiHeadBaseline, HierarchicalCristianGPT, SimpleUnifiedBaseline, HybridRichLSTM, UnifiedCristianGPT
 
 
 # === Load UnifiedShotLSTM Model [GOOD MODEL 1]===
@@ -327,3 +327,73 @@ def load_singlehead_baseline(
     print(f"   Epoch: {checkpoint.get('epoch', 'N/A')}")
 
     return model
+
+def load_hybrid_model_checkpoint(checkpoint_path, dataset, device='cuda'):
+    """
+    Loads the HybridRichLSTM model from a saved .pth checkpoint.
+    """
+    # 1. Re-initialize the model architecture
+    # Ensure these parameters match your training configuration exactly
+    model = HybridRichLSTM(
+        num_players=len(dataset.player_vocab),
+        type_vocab_size=len(dataset.type_vocab),
+        dir_vocab_size=len(dataset.dir_vocab),
+        depth_vocab_size=len(dataset.depth_vocab),
+        context_dim=10
+    )
+    
+    # 2. Load the state dictionary
+    # map_location ensures it loads correctly even if trained on GPU but loaded on CPU
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(state_dict)
+    
+    # 3. Move to target device
+    model.to(device)
+    
+    # 4. Set to evaluation mode (important for Dropout/BatchNorm layers)
+    model.eval()
+    
+    print(f"--- Model loaded successfully from {checkpoint_path} ---")
+    return model
+
+# Usage Example:
+# model = load_hybrid_model_checkpoint('hybrid_rich_lstm.pth', dataset, device='cuda')
+
+def load_UnifiedCristianGPT_checkpoint(checkpoint_path, dataset, embed_dim=128, device="cpu"):
+    """
+    Loads a saved UnifiedCristianGPT model from a state dict.
+    
+    Args:
+        model_class: The class of the model (UnifiedCristianGPT).
+        checkpoint_path: Path to the .pth or .pt file.
+        dataset: The dataset instance (needed for vocab sizes).
+        embed_dim: Must match the dimension used during training.
+        device: The torch device to load onto.
+    """
+    print(f"Loading checkpoint from: {checkpoint_path}")
+    
+    # 1. Initialize the model architecture with identical parameters
+    model = UnifiedCristianGPT(
+        unified_vocab_size=len(dataset.unified_vocab),
+        num_players=len(dataset.player_vocab),
+        context_dim=10, 
+        seq_len=dataset.max_seq_len,
+        embed_dim=embed_dim
+    ).to(device)
+    
+    # 2. Load the state dictionary
+    try:
+        # map_location ensures we don't crash if loading a GPU model onto a CPU
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state_dict)
+        print("✅ Weights loaded successfully.")
+    except Exception as e:
+        print(f"❌ Error loading checkpoint: {e}")
+        return None
+
+    # 3. Set to evaluation mode (turns off Dropout/Batchnorm)
+    model.eval()
+    return model
+
+# --- USAGE ---
+# singleModel1 = load_tennis_checkpoint(UnifiedCristianGPT, save_path, dataset)
