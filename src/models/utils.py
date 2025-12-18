@@ -328,12 +328,7 @@ def load_singlehead_baseline(
 
     return model
 
-def load_hybrid_model_checkpoint(checkpoint_path, dataset, device='cuda'):
-    """
-    Loads the HybridRichLSTM model from a saved .pth checkpoint.
-    """
-    # 1. Re-initialize the model architecture
-    # Ensure these parameters match your training configuration exactly
+def load_hybrid_model_checkpoint(checkpoint_path, dataset, device='cpu'):
     model = HybridRichLSTM(
         num_players=len(dataset.player_vocab),
         type_vocab_size=len(dataset.type_vocab),
@@ -342,15 +337,17 @@ def load_hybrid_model_checkpoint(checkpoint_path, dataset, device='cuda'):
         context_dim=10
     )
     
-    # 2. Load the state dictionary
-    # map_location ensures it loads correctly even if trained on GPU but loaded on CPU
-    state_dict = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(state_dict)
+    # Load the object
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # 3. Move to target device
+    # Check if it's a dictionary containing the state_dict, or just the state_dict itself
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+    else:
+        model.load_state_dict(checkpoint)
+    
     model.to(device)
-    
-    # 4. Set to evaluation mode (important for Dropout/BatchNorm layers)
     model.eval()
     
     print(f"--- Model loaded successfully from {checkpoint_path} ---")
