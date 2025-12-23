@@ -9,6 +9,15 @@ import shutil
 from pathlib import Path
 from typing import Dict, Any, Optional
 
+# Import evaluation classes and functions
+from .evaluation import (
+    ModelAdapter,
+    UnifiedAdapter,
+    MultiHeadAdapter,
+    TennisEvaluator,
+    get_universal_decoder_map
+)
+
 
 def setup_logging(log_file: Optional[Path] = None) -> logging.Logger:
     """
@@ -259,3 +268,22 @@ def set_seed(seed: int = 42):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     # Note: numpy and random seeds would be set here too if needed
+
+
+__all__ = [
+    # Evaluation classes and functions
+    'ModelAdapter',
+    'UnifiedAdapter', 
+    'MultiHeadAdapter',
+    'TennisEvaluator',
+    'get_universal_decoder_map',
+    
+    # Utility functions
+    'setup_logging',
+    'save_checkpoint',
+    'load_checkpoint',
+    'create_experiment_dir',
+    'ensure_directory_exists',
+    'get_device',
+    'set_seed'
+]

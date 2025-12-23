@@ -2,7 +2,7 @@
 Data module initialization.
 """
 
-from .dataset import MCPTennisDataset, SimplifiedTennisDataset
+from .dataset import MCPTennisDataset, EnhancedTennisDataset, MCPMultiTaskDataset, HierarchicalTennisDataset, MCPTennisDatasetGPT, DownsampledDataset, DownsampledHierarchical
 from .utils import (
     create_data_loaders,
     compute_class_weights,
@@ -14,7 +14,12 @@ from .utils import (
 
 __all__ = [
     'MCPTennisDataset',
-    'SimplifiedTennisDataset',
+    'EnhancedTennisDataset',
+    'MCPMultiTaskDataset',
+    'HierarchicalTennisDataset',
+    'MCPTennisDatasetGPT',
+    'DownsampledDataset',
+    'DownsampledHierarchical',
     'create_data_loaders',
     'compute_class_weights',
     'create_zone_mappings',

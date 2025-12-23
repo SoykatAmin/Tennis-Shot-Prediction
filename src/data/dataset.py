@@ -501,7 +501,6 @@ class MCPTennisDataset(Dataset):
             'y_target': self.y_target_tensor[idx]
         }
 
-
 class EnhancedTennisDataset(MCPTennisDataset):
     """
     Extends your original dataset to provide decomposed inputs (Type, Dir, Depth)
@@ -616,6 +615,7 @@ class MCPMultiTaskDataset(Dataset):
         self.data_y_type = []
         self.data_y_dir = []
         self.data_y_depth = []
+        self.sample_match_ids = []
         
         self.pos_map = {'+': 'plus', '-': 'dash', '=': 'eq'}
 
@@ -797,6 +797,7 @@ class MCPMultiTaskDataset(Dataset):
                 self.data_y_type.append(pad + seq_y_type[1:L+1])
                 self.data_y_dir.append(pad + seq_y_dir[1:L+1])
                 self.data_y_depth.append(pad + seq_y_depth[1:L+1])
+                self.sample_match_ids.append(match_id)
 
         # Tensors
         self.x_seq = torch.tensor(self.data_x_seq, dtype=torch.long)
@@ -909,4 +910,650 @@ class HierarchicalTennisDataset(MCPTennisDataset):
         item['y_dir']  = self.y_dir[idx]
         item['y_depth']= self.y_depth[idx]
         
+        return item
+    
+
+class MCPTennisDatasetGPT(Dataset):
+    def __init__(self, points_paths_list, matches_path, atp_path, wta_path, max_seq_len=30):
+        self.max_seq_len = max_seq_len
+        print("Initializing Dataset with CORRECTED Parsing Logic...")
+        
+        # 1. Load Player Data (Height & Hand)
+        self.player_vocab = {'<pad>': 0, '<unk>': 1}
+        self.player_stats = {} # {name: {'hand': 'R', 'height': 185}}
+        self._build_player_stats(atp_path, wta_path)
+        
+        # 2. Load Matches
+        try:
+            self.matches_df = pd.read_csv(matches_path, encoding='ISO-8859-1', engine='python', on_bad_lines='skip')
+        except:
+            self.matches_df = pd.read_csv(matches_path, encoding='ISO-8859-1', quoting=3)
+        self.match_meta = self._process_match_metadata(self.matches_df)
+        
+        # 3. Load Points
+        dfs = []
+        for p_path in points_paths_list:
+            if not os.path.exists(p_path): continue
+            try:
+                d = pd.read_csv(p_path, encoding='ISO-8859-1', engine='python', on_bad_lines='skip')
+                dfs.append(d)
+            except:
+                d = pd.read_csv(p_path, encoding='ISO-8859-1', quoting=3)
+                dfs.append(d)
+        
+        if dfs:
+            self.df = pd.concat(dfs, ignore_index=True)
+            # Sort by Match and Point to track flow
+            self.df['Pt'] = pd.to_numeric(self.df['Pt'], errors='coerce').fillna(0)
+            self.df = self.df.sort_values(by=['match_id', 'Pt'])
+        else:
+            self.df = pd.DataFrame()
+
+        # 4. Vocabularies based on Documentation
+        self.surface_vocab = {'<pad>': 0, 'Hard': 1, 'Clay': 2, 'Grass': 3, 'Carpet': 4}
+        self.hand_vocab = {'<pad>': 0, 'R': 1, 'L': 2}
+        
+        # The Unified Token Vocabulary
+        # We will build this dynamically as we parse to ensure we capture all valid combinations
+        # e.g. "Serve_6", "f_1_7", "b_2"
+        self.unified_vocab = {'<pad>': 0, '<unk>': 1}
+        self.inv_unified_vocab = {0: '<pad>', 1: '<unk>'}
+        
+        # Data Containers
+        self.data_x_seq = []   # Sequence of Unified Token IDs
+        self.data_context = [] # Fixed context (Players, Surface, Score)
+        self.data_x_s_id = []  # Server ID
+        self.data_x_r_id = []  # Receiver ID
+        self.data_y_type = [] # Target List
+        self.sample_match_ids = []
+        
+        self.process_data()
+
+    def _build_player_stats(self, atp_path, wta_path):
+        for path in [atp_path, wta_path]:
+            if not os.path.exists(path): continue
+            try:
+                df = pd.read_csv(path, encoding='utf-8', on_bad_lines='skip')
+                df['full_name'] = df['name_first'].str.strip() + " " + df['name_last'].str.strip()
+                
+                for _, row in df.iterrows():
+                    name = row['full_name']
+                    if name not in self.player_vocab:
+                        self.player_vocab[name] = len(self.player_vocab)
+                    
+                    h = row.get('height')
+                    hand = row.get('hand', 'R')
+                    
+                    height_val = 185 # Default
+                    if pd.notna(h) and str(h).isdigit():
+                        height_val = float(h)
+                        
+                    self.player_stats[name] = {'hand': hand, 'height': height_val}
+            except: pass
+
+    def _process_match_metadata(self, df):
+        meta = {}
+        for _, row in df.iterrows():
+            m_id = row['match_id']
+            # Surface
+            raw_surf = str(row.get('Surface', 'Hard'))
+            if 'Hard' in raw_surf: surf = 'Hard'
+            elif 'Clay' in raw_surf: surf = 'Clay'
+            elif 'Grass' in raw_surf: surf = 'Grass'
+            else: surf = 'Hard'
+            
+            p1 = str(row.get('Player 1', ''))
+            p2 = str(row.get('Player 2', ''))
+            
+            # Lookup Hand/Height from our loaded stats
+            stats1 = self.player_stats.get(p1, {'hand': 'R', 'height': 185})
+            stats2 = self.player_stats.get(p2, {'hand': 'R', 'height': 185})
+            
+            meta[m_id] = {
+                'surface': surf, 
+                'p1_name': p1, 'p2_name': p2, 
+                'p1_hand': stats1['hand'], 'p2_hand': stats2['hand'],
+                'p1_h': stats1['height'], 'p2_h': stats2['height']
+            }
+        return meta
+
+    def get_pressure_score(self, pts, gm1, gm2):
+        # 0=Normal, 1=Tiebreak, 2=BreakPoint
+        if not isinstance(pts, str) or '-' not in pts: return 0
+        try:
+            s_pts, r_pts = pts.split('-')
+            # Check Break Point (Receiver has 40 or AD)
+            if (r_pts == '40' and s_pts != '40' and s_pts != 'AD') or (r_pts == 'AD'):
+                return 2
+            # Check Tiebreak
+            if int(gm1) == 6 and int(gm2) == 6:
+                return 1
+        except: pass
+        return 0
+
+    def process_data(self):
+        print("Parsing Rallies into Unified Tokens...")
+        
+        # Regex to split shots:
+        # 1. Serves: Start with 4, 5, or 6. Can have modifiers (+, -, =).
+        # 2. Shots: Start with char (f, b, s, r, v, ...).
+        # We split the string by looking for these boundaries.
+        
+        # Pattern explanation:
+        # ([456][0-9+=-]*)  -> Capture Serve (starts with 4,5,6, followed by optional chars)
+        # |                 -> OR
+        # ([fbsrvolmzup][0-9+=-]*) -> Capture Shot (starts with type char, followed by optional chars)
+        split_pattern = re.compile(r'([456][0-9+=-]*|[fbsrvolmzup][0-9+=-]*)')
+        
+        # Helper to extract digits from a shot string
+        # e.g. "s17" -> ['1', '7']
+        digit_pattern = re.compile(r'\d')
+        
+        prev_point_state = (0, 0) # (WinnerWasServer, RallyLen)
+        last_match_id = None
+        
+        for _, row in self.df.iterrows():
+            match_id = row['match_id']
+            if match_id != last_match_id:
+                prev_point_state = (0, 0)
+                last_match_id = match_id
+            
+            rally_str = str(row['2nd']) if pd.notna(row['2nd']) else str(row['1st'])
+            if pd.isna(rally_str) or rally_str == 'nan': continue
+
+            # --- CONTEXT ---
+            m_meta = self.match_meta.get(match_id, {'surface': 'Hard', 'p1_name':'?', 'p2_name':'?'})
+            
+            svr = row['Svr'] if 'Svr' in row else 1
+            if svr == 2:
+                s_name, r_name = m_meta['p2_name'], m_meta['p1_name']
+                s_h, r_h = m_meta['p2_h'], m_meta['p1_h']
+                s_hand, r_hand = m_meta['p2_hand'], m_meta['p1_hand']
+            else:
+                s_name, r_name = m_meta['p1_name'], m_meta['p2_name']
+                s_h, r_h = m_meta['p1_h'], m_meta['p2_h']
+                s_hand, r_hand = m_meta['p1_hand'], m_meta['p2_hand']
+
+            s_id = self.player_vocab.get(s_name, 1)
+            r_id = self.player_vocab.get(r_name, 1)
+            
+            # Context Features
+            surf_idx = self.surface_vocab.get(m_meta['surface'], 1)
+            sh_idx = self.hand_vocab.get(s_hand, 1)
+            rh_idx = self.hand_vocab.get(r_hand, 1)
+            sh_norm = (s_h - 180) / 10.0
+            rh_norm = (r_h - 180) / 10.0
+            pressure = self.get_pressure_score(str(row.get('Pts','')), row.get('Gm1',0), row.get('Gm2',0))
+            prev_win, prev_len = prev_point_state
+            is_2nd = 1 if pd.notna(row['2nd']) else 0
+            
+            context_vec = [surf_idx, sh_idx, rh_idx, sh_norm, rh_norm, pressure, prev_win, prev_len, is_2nd, 0]
+
+            # --- RALLY PARSING ---
+            r_clean = re.sub(r'[@#n*!+;]', '', rally_str).lstrip('c')
+            if not r_clean: continue
+            
+            # Find all shots
+            raw_shots = split_pattern.findall(r_clean)
+            if not raw_shots: continue
+            
+            unified_tokens = []
+            
+            for i, shot_str in enumerate(raw_shots):
+                # 1. PARSE SERVE (First shot, starts with digit)
+                if shot_str[0].isdigit():
+                    # Format: "6", "5", "4+"
+                    direction = shot_str[0] # 4, 5, or 6
+                    token = f"Serve_{direction}"
+                else:
+                    # 2. PARSE SHOT (Starts with char)
+                    # Format: "f1", "s17", "b2"
+                    typ = shot_str[0] # f, b, s, ...
+                    
+                    # Extract digits
+                    digits = digit_pattern.findall(shot_str)
+                    
+                    direction = digits[0] if len(digits) > 0 else '0' # 1, 2, 3
+                    depth = digits[1] if len(digits) > 1 else '0'     # 7, 8, 9
+                    
+                    token = f"{typ}_{direction}_{depth}"
+                
+                # Add to vocab if new
+                if token not in self.unified_vocab:
+                    self.unified_vocab[token] = len(self.unified_vocab)
+                    self.inv_unified_vocab[self.unified_vocab[token]] = token
+                
+                unified_tokens.append(self.unified_vocab[token])
+            
+            # Create Sequence
+            if len(unified_tokens) >= 2:
+                # Update Flow State
+                curr_winner = row.get('PtWinner', 0)
+                try: curr_winner = int(curr_winner)
+                except: curr_winner = 0
+                prev_point_state = (1 if curr_winner == svr else 0, len(unified_tokens))
+                
+                # Input: [Serve, Shot1, Shot2...]
+                # Target: [Shot1, Shot2, Shot3...]
+                
+                seq_x = unified_tokens[:-1]
+                seq_y = unified_tokens[1:]
+                
+                L = min(len(seq_x), self.max_seq_len)
+                pad = [0] * (self.max_seq_len - L)
+                
+                self.data_x_seq.append(pad + seq_x[:L])
+                self.data_context.append(context_vec)
+                self.data_x_s_id.append(s_id)
+                self.data_x_r_id.append(r_id)
+                
+                # Target is just the Unified ID
+                self.data_y_type.append(pad + seq_y[:L]) # Reusing this list name for Y
+                self.sample_match_ids.append(match_id)
+
+        print(f"Dataset Built. Unique Unified Shots Found: {len(self.unified_vocab)}")
+        
+        self.x_seq_tensor = torch.tensor(self.data_x_seq, dtype=torch.long)
+        self.context_tensor = torch.tensor(self.data_context, dtype=torch.float32)
+        self.x_s_id_tensor = torch.tensor(self.data_x_s_id, dtype=torch.long)
+        self.x_r_id_tensor = torch.tensor(self.data_x_r_id, dtype=torch.long)
+        self.y_target_tensor = torch.tensor(self.data_y_type, dtype=torch.long)
+        
+        del self.data_x_seq, self.data_y_type
+
+    def __len__(self): return len(self.sample_match_ids)
+    def __getitem__(self, idx):
+        return {
+            'x_seq': self.x_seq_tensor[idx],
+            'context': self.context_tensor[idx],
+            'x_s_id': self.x_s_id_tensor[idx],
+            'x_r_id': self.x_r_id_tensor[idx],
+            'y_target': self.y_target_tensor[idx]
+        }
+    
+
+class DownsampledDataset(Dataset):
+    def __init__(self, points_paths_list, matches_path, atp_path, wta_path, max_seq_len=30):
+        self.max_seq_len = max_seq_len
+        print("Initializing Dataset with Downsampling Logic...")
+        
+        # 1. Load Player Data (Height & Hand)
+        self.player_vocab = {'<pad>': 0, '<unk>': 1}
+        self.player_stats = {} 
+        self._build_player_stats(atp_path, wta_path)
+        
+        # 2. Load Matches
+        try:
+            self.matches_df = pd.read_csv(matches_path, encoding='ISO-8859-1', engine='python', on_bad_lines='skip')
+        except:
+            self.matches_df = pd.read_csv(matches_path, encoding='ISO-8859-1', quoting=3)
+
+        # --- NEW STEP: DOWNSAMPLE MATCHES ---
+        self._downsample_matches()
+        # ------------------------------------
+
+        self.match_meta = self._process_match_metadata(self.matches_df)
+        
+        # 3. Load Points
+        dfs = []
+        for p_path in points_paths_list:
+            if not os.path.exists(p_path): continue
+            try:
+                d = pd.read_csv(p_path, encoding='ISO-8859-1', engine='python', on_bad_lines='skip')
+                dfs.append(d)
+            except:
+                d = pd.read_csv(p_path, encoding='ISO-8859-1', quoting=3)
+                dfs.append(d)
+        
+        if dfs:
+            self.df = pd.concat(dfs, ignore_index=True)
+            
+            # --- FILTER POINTS DATAFRAME IMMEDIATELY ---
+            # This speeds up processing significantly by removing points from deleted matches
+            print(f"Points before filtering: {len(self.df)}")
+            self.df = self.df[self.df['match_id'].isin(self.valid_match_ids)]
+            print(f"Points after filtering: {len(self.df)}")
+            
+            # Sort by Match and Point to track flow
+            self.df['Pt'] = pd.to_numeric(self.df['Pt'], errors='coerce').fillna(0)
+            self.df = self.df.sort_values(by=['match_id', 'Pt'])
+        else:
+            self.df = pd.DataFrame()
+
+        # 4. Vocabularies
+        self.surface_vocab = {'<pad>': 0, 'Hard': 1, 'Clay': 2, 'Grass': 3, 'Carpet': 4}
+        self.hand_vocab = {'<pad>': 0, 'R': 1, 'L': 2}
+        
+        self.unified_vocab = {'<pad>': 0, '<unk>': 1}
+        self.inv_unified_vocab = {0: '<pad>', 1: '<unk>'}
+        
+        # Data Containers
+        self.data_x_seq = []   
+        self.data_context = [] 
+        self.data_x_s_id = []  
+        self.data_x_r_id = []  
+        self.data_y_type = [] 
+        self.sample_match_ids = []
+        
+        self.process_data()
+
+    def _downsample_matches(self):
+        print("--- Downsampling Matches ---")
+        
+        # 1. Define Targets
+        target_counts = {
+            'Hard': 2305, # ~66% of 3480
+            'Clay': 781,
+            'Grass': 394
+        }
+        total_target = sum(target_counts.values())
+        
+        # 2. Group Match IDs by Surface
+        surface_groups = {'Hard': [], 'Clay': [], 'Grass': []}
+        
+        for _, row in self.matches_df.iterrows():
+            m_id = row['match_id']
+            raw_surf = str(row.get('Surface', 'Hard'))
+            
+            # Normalize Surface (Carpet -> Hard)
+            if 'Carpet' in raw_surf or 'Hard' in raw_surf:
+                s_key = 'Hard'
+            elif 'Clay' in raw_surf:
+                s_key = 'Clay'
+            elif 'Grass' in raw_surf:
+                s_key = 'Grass'
+            else:
+                s_key = 'Hard' # Default
+            
+            surface_groups[s_key].append(m_id)
+            
+        # 3. Randomly Sample
+        selected_ids = []
+        
+        for surf, targets in target_counts.items():
+            available = surface_groups[surf]
+            n_avail = len(available)
+            n_needed = targets
+            
+            print(f"Surface {surf}: Found {n_avail}, Need {n_needed}")
+            
+            if n_avail > n_needed:
+                # Randomly pick n_needed
+                selected = random.sample(available, n_needed)
+            else:
+                # Take all available if we don't have enough
+                selected = available
+                
+            selected_ids.extend(selected)
+            
+        self.valid_match_ids = set(selected_ids)
+        print(f"Total Matches kept: {len(self.valid_match_ids)} (Target: {total_target})")
+        
+        # 4. Filter the Matches DataFrame itself to save memory
+        self.matches_df = self.matches_df[self.matches_df['match_id'].isin(self.valid_match_ids)]
+
+    def _build_player_stats(self, atp_path, wta_path):
+        for path in [atp_path, wta_path]:
+            if not os.path.exists(path): continue
+            try:
+                df = pd.read_csv(path, encoding='utf-8', on_bad_lines='skip')
+                df['full_name'] = df['name_first'].str.strip() + " " + df['name_last'].str.strip()
+                
+                for _, row in df.iterrows():
+                    name = row['full_name']
+                    if name not in self.player_vocab:
+                        self.player_vocab[name] = len(self.player_vocab)
+                    
+                    h = row.get('height')
+                    hand = row.get('hand', 'R')
+                    
+                    height_val = 185 # Default
+                    if pd.notna(h) and str(h).isdigit():
+                        height_val = float(h)
+                        
+                    self.player_stats[name] = {'hand': hand, 'height': height_val}
+            except: pass
+
+    def _process_match_metadata(self, df):
+        meta = {}
+        for _, row in df.iterrows():
+            m_id = row['match_id']
+            # Surface
+            raw_surf = str(row.get('Surface', 'Hard'))
+            if 'Hard' in raw_surf: surf = 'Hard'
+            elif 'Clay' in raw_surf: surf = 'Clay'
+            elif 'Grass' in raw_surf: surf = 'Grass'
+            else: surf = 'Hard'
+            
+            p1 = str(row.get('Player 1', ''))
+            p2 = str(row.get('Player 2', ''))
+            
+            # Lookup Hand/Height from our loaded stats
+            stats1 = self.player_stats.get(p1, {'hand': 'R', 'height': 185})
+            stats2 = self.player_stats.get(p2, {'hand': 'R', 'height': 185})
+            
+            meta[m_id] = {
+                'surface': surf, 
+                'p1_name': p1, 'p2_name': p2, 
+                'p1_hand': stats1['hand'], 'p2_hand': stats2['hand'],
+                'p1_h': stats1['height'], 'p2_h': stats2['height']
+            }
+        return meta
+
+    def get_pressure_score(self, pts, gm1, gm2):
+        # 0=Normal, 1=Tiebreak, 2=BreakPoint
+        if not isinstance(pts, str) or '-' not in pts: return 0
+        try:
+            s_pts, r_pts = pts.split('-')
+            # Check Break Point (Receiver has 40 or AD)
+            if (r_pts == '40' and s_pts != '40' and s_pts != 'AD') or (r_pts == 'AD'):
+                return 2
+            # Check Tiebreak
+            if int(gm1) == 6 and int(gm2) == 6:
+                return 1
+        except: pass
+        return 0
+
+    def process_data(self):
+        print("Parsing Rallies into Unified Tokens...")
+        
+        split_pattern = re.compile(r'([456][0-9+=-]*|[fbsrvolmzup][0-9+=-]*)')
+        digit_pattern = re.compile(r'\d')
+        
+        prev_point_state = (0, 0) # (WinnerWasServer, RallyLen)
+        last_match_id = None
+        
+        for _, row in self.df.iterrows():
+            match_id = row['match_id']
+            
+            # Skip if this match wasn't in our downsampled list
+            if match_id not in self.valid_match_ids:
+                continue
+
+            if match_id != last_match_id:
+                prev_point_state = (0, 0)
+                last_match_id = match_id
+            
+            rally_str = str(row['2nd']) if pd.notna(row['2nd']) else str(row['1st'])
+            if pd.isna(rally_str) or rally_str == 'nan': continue
+
+            # --- CONTEXT ---
+            m_meta = self.match_meta.get(match_id, {'surface': 'Hard', 'p1_name':'?', 'p2_name':'?'})
+            
+            svr = row['Svr'] if 'Svr' in row else 1
+            if svr == 2:
+                s_name, r_name = m_meta['p2_name'], m_meta['p1_name']
+                s_h, r_h = m_meta['p2_h'], m_meta['p1_h']
+                s_hand, r_hand = m_meta['p2_hand'], m_meta['p1_hand']
+            else:
+                s_name, r_name = m_meta['p1_name'], m_meta['p2_name']
+                s_h, r_h = m_meta['p1_h'], m_meta['p2_h']
+                s_hand, r_hand = m_meta['p1_hand'], m_meta['p2_hand']
+
+            s_id = self.player_vocab.get(s_name, 1)
+            r_id = self.player_vocab.get(r_name, 1)
+            
+            # Context Features
+            surf_idx = self.surface_vocab.get(m_meta['surface'], 1)
+            sh_idx = self.hand_vocab.get(s_hand, 1)
+            rh_idx = self.hand_vocab.get(r_hand, 1)
+            sh_norm = (s_h - 180) / 10.0
+            rh_norm = (r_h - 180) / 10.0
+            pressure = self.get_pressure_score(str(row.get('Pts','')), row.get('Gm1',0), row.get('Gm2',0))
+            prev_win, prev_len = prev_point_state
+            is_2nd = 1 if pd.notna(row['2nd']) else 0
+            
+            context_vec = [surf_idx, sh_idx, rh_idx, sh_norm, rh_norm, pressure, prev_win, prev_len, is_2nd, 0]
+
+            # --- RALLY PARSING ---
+            r_clean = re.sub(r'[@#n*!+;]', '', rally_str).lstrip('c')
+            if not r_clean: continue
+            
+            # Find all shots
+            raw_shots = split_pattern.findall(r_clean)
+            if not raw_shots: continue
+            
+            unified_tokens = []
+            
+            for i, shot_str in enumerate(raw_shots):
+                # 1. PARSE SERVE (First shot, starts with digit)
+                if shot_str[0].isdigit():
+                    # Format: "6", "5", "4+"
+                    direction = shot_str[0] # 4, 5, or 6
+                    token = f"Serve_{direction}"
+                else:
+                    # 2. PARSE SHOT (Starts with char)
+                    # Format: "f1", "s17", "b2"
+                    typ = shot_str[0] # f, b, s, ...
+                    
+                    # Extract digits
+                    digits = digit_pattern.findall(shot_str)
+                    
+                    direction = digits[0] if len(digits) > 0 else '0' # 1, 2, 3
+                    depth = digits[1] if len(digits) > 1 else '0'      # 7, 8, 9
+                    
+                    token = f"{typ}_{direction}_{depth}"
+                
+                # Add to vocab if new
+                if token not in self.unified_vocab:
+                    self.unified_vocab[token] = len(self.unified_vocab)
+                    self.inv_unified_vocab[self.unified_vocab[token]] = token
+                
+                unified_tokens.append(self.unified_vocab[token])
+            
+            # Create Sequence
+            if len(unified_tokens) >= 2:
+                # Update Flow State
+                curr_winner = row.get('PtWinner', 0)
+                try: curr_winner = int(curr_winner)
+                except: curr_winner = 0
+                prev_point_state = (1 if curr_winner == svr else 0, len(unified_tokens))
+                
+                seq_x = unified_tokens[:-1]
+                seq_y = unified_tokens[1:]
+                
+                L = min(len(seq_x), self.max_seq_len)
+                pad = [0] * (self.max_seq_len - L)
+                
+                self.data_x_seq.append(pad + seq_x[:L])
+                self.data_context.append(context_vec)
+                self.data_x_s_id.append(s_id)
+                self.data_x_r_id.append(r_id)
+                
+                # Target is just the Unified ID
+                self.data_y_type.append(pad + seq_y[:L]) # Reusing this list name for Y
+                self.sample_match_ids.append(match_id)
+
+        print(f"Dataset Built. Unique Unified Shots Found: {len(self.unified_vocab)}")
+        
+        self.x_seq_tensor = torch.tensor(self.data_x_seq, dtype=torch.long)
+        self.context_tensor = torch.tensor(self.data_context, dtype=torch.float32)
+        self.x_s_id_tensor = torch.tensor(self.data_x_s_id, dtype=torch.long)
+        self.x_r_id_tensor = torch.tensor(self.data_x_r_id, dtype=torch.long)
+        self.y_target_tensor = torch.tensor(self.data_y_type, dtype=torch.long)
+        
+        del self.data_x_seq, self.data_y_type
+
+    def __len__(self): return len(self.sample_match_ids)
+    def __getitem__(self, idx):
+        return {
+            'x_seq': self.x_seq_tensor[idx],
+            'context': self.context_tensor[idx],
+            'x_s_id': self.x_s_id_tensor[idx],
+            'x_r_id': self.x_r_id_tensor[idx],
+            'y_target': self.y_target_tensor[idx]
+        }
+    
+class DownsampledHierarchical(DownsampledDataset):
+    """
+    Final Dataset for Hierarchical Training.
+    Inherits from DownsampledDataset (which now includes Downsampling).
+    """
+    def __init__(self, *args, **kwargs):
+        # 1. Define Vocabs
+        self.type_vocab = {k: v for v, k in enumerate(['<pad>', '<unk>', 'serve', 'f', 'b', 'r', 's', 'v', 'z', 'o', 'p', 'u', 'y', 'l', 'm', 'h', 'i', 'j', 'k', 't', 'q', 'special', 'let'])}
+        self.dir_vocab  = {k: v for v, k in enumerate(['<pad>', '0', '1', '2', '3'])}
+        self.depth_vocab= {k: v for v, k in enumerate(['<pad>', '0', '7', '8', '9'])}
+        
+        # 2. Init Parent (Loads data, downsamples, builds unified tokens)
+        super().__init__(*args, **kwargs)
+        
+        # 3. Decompose BOTH Inputs and Targets
+        self._decompose_data()
+
+    def _decompose_data(self):
+        print("Decomposing Data for Hierarchical Training...")
+        x_t_list, x_d_list, x_dp_list = [], [], []
+        y_t_list, y_d_list, y_dp_list = [], [], []
+
+        x_seq_raw = self.x_seq_tensor.tolist()
+        y_seq_raw = self.y_target_tensor.tolist()
+
+        for x_row, y_row in zip(x_seq_raw, y_seq_raw):
+            xt, xd, xdp = self._decompose_sequence(x_row)
+            x_t_list.append(xt); x_d_list.append(xd); x_dp_list.append(xdp)
+
+            yt, yd, ydp = self._decompose_sequence(y_row)
+            y_t_list.append(yt); y_d_list.append(yd); y_dp_list.append(ydp)
+
+        self.x_type = torch.tensor(x_t_list, dtype=torch.long)
+        self.x_dir  = torch.tensor(x_d_list, dtype=torch.long)
+        self.x_depth= torch.tensor(x_dp_list, dtype=torch.long)
+
+        self.y_type = torch.tensor(y_t_list, dtype=torch.long)
+        self.y_dir  = torch.tensor(y_d_list, dtype=torch.long)
+        self.y_depth= torch.tensor(y_dp_list, dtype=torch.long)
+
+    def _decompose_sequence(self, seq_ids):
+        seq_t, seq_d, seq_dp = [], [], []
+        for token_id in seq_ids:
+            if token_id == 0: 
+                seq_t.append(0); seq_d.append(0); seq_dp.append(0)
+                continue
+            
+            key = self.inv_unified_vocab.get(token_id, '<unk>')
+            if key.startswith('Serve'):
+                t, d, dp = 'serve', '0', '0'
+            elif '_' in key:
+                parts = key.split('_')
+                t = parts[0]
+                d = parts[1] if len(parts) > 1 else '0'
+                dp = parts[2] if len(parts) > 2 else '0'
+            else:
+                t, d, dp = key, '0', '0'
+
+            seq_t.append(self.type_vocab.get(t, 1))
+            seq_d.append(self.dir_vocab.get(d, 1))
+            seq_dp.append(self.depth_vocab.get(dp, 1))
+            
+        return seq_t, seq_d, seq_dp
+
+    def __getitem__(self, idx):
+        item = super().__getitem__(idx)
+        item['x_type'] = self.x_type[idx]
+        item['x_dir']  = self.x_dir[idx]
+        item['x_depth']= self.x_depth[idx]
+        item['y_type'] = self.y_type[idx]
+        item['y_dir']  = self.y_dir[idx]
+        item['y_depth']= self.y_depth[idx]
         return item

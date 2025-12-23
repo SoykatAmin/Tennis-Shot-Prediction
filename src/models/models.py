@@ -521,6 +521,7 @@ class SimpleMultiHeadBaseline(nn.Module):
         logits_depth = self.head_depth(features)
         
         return logits_type, logits_dir, logits_depth
+
     
 class HierarchicalCristianGPT(nn.Module):
     def __init__(self, dir_vocab_size, depth_vocab_size, type_vocab_size, num_players, 
@@ -766,3 +767,4 @@ class UnifiedCristianGPT(nn.Module):
         x = self.norm_f(x)
         
         return self.head(x)
+    
