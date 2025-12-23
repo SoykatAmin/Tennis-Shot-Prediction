@@ -101,6 +101,7 @@ import seaborn as sns
 import pandas as pd
 from collections import Counter
 import random
+
 class TennisEvaluator:
     def __init__(self, adapter, test_loader, test_indices):
         self.adapter = adapter
@@ -109,26 +110,21 @@ class TennisEvaluator:
         self.test_indices = test_indices
         
         # --- 1. Define Standard Vocabs (Fallbacks) ---
-        # These match your MCPTennisDataset spec
         self.STD_SHOT_VOCAB = {'<pad>': 0, 'f': 1, 'b': 2, 'r': 3, 'v': 4, 'o': 5, 's': 6, 'u': 7, 'l': 8, 'm': 9, 'z': 10}
-        self.STD_DIR_VOCAB  = {'<pad>': 0, '0': 0, '1': 1, '2': 2, '3': 3} # 1=Right, 2=Center, 3=Left
+        self.STD_DIR_VOCAB  = {'<pad>': 0, '0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6}
         self.STD_DEPTH_VOCAB = {'<pad>': 0, '0': 0, '7': 1, '8': 2, '9': 3}
 
         # --- 2. Create Inverse Lookups (Robustly) ---
-        
-        # TYPE VOCAB
         if hasattr(self.dataset, 'type_vocab'):
             self.inv_type = {v: k for k, v in self.dataset.type_vocab.items()}
         else:
             self.inv_type = {v: k for k, v in self.STD_SHOT_VOCAB.items()}
             
-        # DIRECTION VOCAB
         if hasattr(self.dataset, 'dir_vocab'):
             self.inv_dir = {v: k for k, v in self.dataset.dir_vocab.items()}
         else:
             self.inv_dir = {v: k for k, v in self.STD_DIR_VOCAB.items()}
             
-        # DEPTH VOCAB
         if hasattr(self.dataset, 'depth_vocab'):
             self.inv_depth = {v: k for k, v in self.dataset.depth_vocab.items()}
         else:
@@ -147,14 +143,15 @@ class TennisEvaluator:
         
         with torch.no_grad():
             for batch in self.loader:
-                (pt, pd, pdp), (tt, td, tdp) = self.adapter.decode_batch(batch)
+                # RENAMED VARIABLES HERE TO AVOID SHADOWING
+                (p_t, p_d, p_dp), (t_t, t_d, t_dp) = self.adapter.decode_batch(batch)
                 
                 # Filter Masks (Ignore 0)
-                mask = (tt != 0)
+                mask = (t_t != 0)
                 if mask.sum() > 0:
-                    all_pt.extend(pt[mask]); all_tt.extend(tt[mask])
-                    all_pd.extend(pd[mask]); all_td.extend(td[mask])
-                    all_pdp.extend(pdp[mask]); all_tdp.extend(tdp[mask])
+                    all_pt.extend(p_t[mask]); all_tt.extend(t_t[mask])
+                    all_pd.extend(p_d[mask]); all_td.extend(t_d[mask])
+                    all_pdp.extend(p_dp[mask]); all_tdp.extend(t_dp[mask])
 
         # Reports
         self._print_report(all_tt, all_pt, self.inv_type, "SHOT TYPE")
@@ -163,7 +160,6 @@ class TennisEvaluator:
 
     def _print_report(self, y_true, y_pred, inv_vocab, title):
         print(f"\n=== {title} REPORT ===")
-        # Filter labels to only those present in y_true/y_pred or valid vocab keys
         unique_labels = sorted(list(set(y_true) | set(y_pred)))
         labels = [l for l in unique_labels if l in inv_vocab and l != 0]
         names = [inv_vocab[l] for l in labels]
@@ -176,16 +172,14 @@ class TennisEvaluator:
     def part6_surface_analysis(self):
         print("\n" + "="*40 + "\n PART 6: SURFACE ANALYSIS \n" + "="*40)
         
-        # Check if we have match metadata
         if not hasattr(self.dataset, 'match_meta') or not hasattr(self.dataset, 'sample_match_ids'):
-            print("Skipping Surface Analysis: Dataset missing 'match_meta' or 'sample_match_ids'.")
+            print("Skipping Surface Analysis: Dataset missing metadata.")
             return
 
         # 1. Map indices to surfaces
         surf_map = {'Hard': [], 'Clay': [], 'Grass': []}
         for idx in self.test_indices:
             mid = self.dataset.sample_match_ids[idx]
-            # Default to Hard if missing
             s = self.dataset.match_meta.get(mid, {}).get('surface', 'Hard')
             
             if 'Clay' in s: surf_map['Clay'].append(idx)
@@ -197,23 +191,21 @@ class TennisEvaluator:
         for surf, indices in surf_map.items():
             if not indices: continue
             
-            # Create a temp loader for this surface
-            # Limit to 2000 samples for speed
+            # Create a temp loader (limit to 2000 samples for speed)
             subset = torch.utils.data.Subset(self.dataset, indices[:2000]) 
             loader = torch.utils.data.DataLoader(subset, batch_size=256, shuffle=False)
             
             with torch.no_grad():
                 for batch in loader:
-                    (pt, pd, pdp), (tt, td, tdp) = self.adapter.decode_batch(batch)
+                    # FIX: Rename 'pd' -> 'p_d' to stop shadowing pandas
+                    (p_t, p_d, p_dp), (t_t, t_d, t_dp) = self.adapter.decode_batch(batch)
                     
-                    # Calculate vectorized errors
-                    mask = (tt != 0)
-                    
+                    mask = (t_t != 0)
                     if mask.sum() == 0: continue
 
-                    t_err = (pt[mask] != tt[mask]).astype(float)
-                    d_err = (pd[mask] != td[mask]).astype(float)
-                    dp_err = (pdp[mask] != tdp[mask]).astype(float)
+                    t_err = (p_t[mask] != t_t[mask]).astype(float)
+                    d_err = (p_d[mask] != t_d[mask]).astype(float)
+                    dp_err = (p_dp[mask] != t_dp[mask]).astype(float)
                     
                     for i in range(len(t_err)):
                         results.append({
@@ -224,15 +216,16 @@ class TennisEvaluator:
                         })
         
         if results:
+            # Now 'pd' correctly refers to pandas, not the prediction array
             df = pd.DataFrame(results)
             print(df.groupby('Surface').mean() * 100)
             
-            # Plot
             df_melt = df.melt(id_vars=['Surface'], value_vars=['Type Error', 'Direction Error', 'Depth Error'], value_name='Error')
             plt.figure(figsize=(10,5))
             sns.barplot(data=df_melt, x='Surface', y='Error', hue='variable', palette='viridis')
             plt.title("Error Rates by Surface")
             plt.show()
+
 def get_universal_decoder_map(dataset):
     """
     Creates a lookup table: Unified_ID -> (Type_ID, Dir_ID, Depth_ID).
