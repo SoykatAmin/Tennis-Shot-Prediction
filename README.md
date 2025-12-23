@@ -2,7 +2,7 @@
 
 Given an ongoing tennis rally, we will predict the direction, depth, and type of the next shot. This could be used by amateur players as a sort of virtual coach for strategy. We employ 6 different models to achieve this.
 
-## 🗂️ Repository Structure
+## Repository Structure
 
 ```text
 Tennis-Shot-Prediction/
@@ -17,7 +17,7 @@ Tennis-Shot-Prediction/
 └── docs/               # Documentation
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Data Requirements
 
