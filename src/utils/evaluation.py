@@ -101,7 +101,6 @@ import seaborn as sns
 import pandas as pd
 from collections import Counter
 import random
-
 class TennisEvaluator:
     def __init__(self, adapter, test_loader, test_indices):
         self.adapter = adapter
@@ -109,16 +108,36 @@ class TennisEvaluator:
         self.dataset = adapter.dataset
         self.test_indices = test_indices
         
-        # Standard Vocabs (Inverted)
-        self.inv_type = {v: k for k, v in self.dataset.type_vocab.items()}
-        self.inv_dir = {v: k for k, v in self.dataset.dir_vocab.items()}
-        self.inv_depth = {v: k for k, v in self.dataset.depth_vocab.items()}
+        # --- 1. Define Standard Vocabs (Fallbacks) ---
+        # These match your MCPTennisDataset spec
+        self.STD_SHOT_VOCAB = {'<pad>': 0, 'f': 1, 'b': 2, 'r': 3, 'v': 4, 'o': 5, 's': 6, 'u': 7, 'l': 8, 'm': 9, 'z': 10}
+        self.STD_DIR_VOCAB  = {'<pad>': 0, '0': 0, '1': 1, '2': 2, '3': 3} # 1=Right, 2=Center, 3=Left
+        self.STD_DEPTH_VOCAB = {'<pad>': 0, '0': 0, '7': 1, '8': 2, '9': 3}
+
+        # --- 2. Create Inverse Lookups (Robustly) ---
+        
+        # TYPE VOCAB
+        if hasattr(self.dataset, 'type_vocab'):
+            self.inv_type = {v: k for k, v in self.dataset.type_vocab.items()}
+        else:
+            self.inv_type = {v: k for k, v in self.STD_SHOT_VOCAB.items()}
+            
+        # DIRECTION VOCAB
+        if hasattr(self.dataset, 'dir_vocab'):
+            self.inv_dir = {v: k for k, v in self.dataset.dir_vocab.items()}
+        else:
+            self.inv_dir = {v: k for k, v in self.STD_DIR_VOCAB.items()}
+            
+        # DEPTH VOCAB
+        if hasattr(self.dataset, 'depth_vocab'):
+            self.inv_depth = {v: k for k, v in self.dataset.depth_vocab.items()}
+        else:
+            self.inv_depth = {v: k for k, v in self.STD_DEPTH_VOCAB.items()}
         
     def run_all(self):
         """Runs the entire pipeline."""
         self.part1_tactical_metrics()
         self.part6_surface_analysis()
-        # Add other parts (2, 3, 4, 5) similarly...
         print("Evaluation Complete.")
 
     def part1_tactical_metrics(self):
@@ -144,27 +163,43 @@ class TennisEvaluator:
 
     def _print_report(self, y_true, y_pred, inv_vocab, title):
         print(f"\n=== {title} REPORT ===")
-        labels = sorted([k for k in inv_vocab.keys() if k in np.unique(y_true) and k != 0])
-        names = [inv_vocab[k] for k in labels]
-        print(classification_report(y_true, y_pred, labels=labels, target_names=names, zero_division=0))
+        # Filter labels to only those present in y_true/y_pred or valid vocab keys
+        unique_labels = sorted(list(set(y_true) | set(y_pred)))
+        labels = [l for l in unique_labels if l in inv_vocab and l != 0]
+        names = [inv_vocab[l] for l in labels]
+        
+        if labels:
+            print(classification_report(y_true, y_pred, labels=labels, target_names=names, zero_division=0))
+        else:
+            print("No valid labels found for report.")
 
     def part6_surface_analysis(self):
         print("\n" + "="*40 + "\n PART 6: SURFACE ANALYSIS \n" + "="*40)
+        
+        # Check if we have match metadata
+        if not hasattr(self.dataset, 'match_meta') or not hasattr(self.dataset, 'sample_match_ids'):
+            print("Skipping Surface Analysis: Dataset missing 'match_meta' or 'sample_match_ids'.")
+            return
+
         # 1. Map indices to surfaces
         surf_map = {'Hard': [], 'Clay': [], 'Grass': []}
         for idx in self.test_indices:
             mid = self.dataset.sample_match_ids[idx]
+            # Default to Hard if missing
             s = self.dataset.match_meta.get(mid, {}).get('surface', 'Hard')
+            
             if 'Clay' in s: surf_map['Clay'].append(idx)
             elif 'Grass' in s: surf_map['Grass'].append(idx)
             else: surf_map['Hard'].append(idx)
 
         results = []
-        # Reuse the batch logic by subsetting
+        
         for surf, indices in surf_map.items():
             if not indices: continue
+            
             # Create a temp loader for this surface
-            subset = torch.utils.data.Subset(self.dataset, indices[:2000]) # Limit samples for speed
+            # Limit to 2000 samples for speed
+            subset = torch.utils.data.Subset(self.dataset, indices[:2000]) 
             loader = torch.utils.data.DataLoader(subset, batch_size=256, shuffle=False)
             
             with torch.no_grad():
@@ -173,9 +208,12 @@ class TennisEvaluator:
                     
                     # Calculate vectorized errors
                     mask = (tt != 0)
+                    
+                    if mask.sum() == 0: continue
+
                     t_err = (pt[mask] != tt[mask]).astype(float)
                     d_err = (pd[mask] != td[mask]).astype(float)
-                    dp_err = (pdp[mask] != tdp[mask]).astype(float) # Note: You might want deeper masking logic here
+                    dp_err = (pdp[mask] != tdp[mask]).astype(float)
                     
                     for i in range(len(t_err)):
                         results.append({
@@ -188,37 +226,33 @@ class TennisEvaluator:
         if results:
             df = pd.DataFrame(results)
             print(df.groupby('Surface').mean() * 100)
+            
             # Plot
             df_melt = df.melt(id_vars=['Surface'], value_vars=['Type Error', 'Direction Error', 'Depth Error'], value_name='Error')
             plt.figure(figsize=(10,5))
             sns.barplot(data=df_melt, x='Surface', y='Error', hue='variable', palette='viridis')
             plt.title("Error Rates by Surface")
             plt.show()
-
 def get_universal_decoder_map(dataset):
     """
     Creates a lookup table: Unified_ID -> (Type_ID, Dir_ID, Depth_ID).
-    Robustly handles Serves, Specials, and standard shots.
+    Compatible with MCPTennisDataset.
     """
-    # 1. Define Standard Mappings (Ensure these match your EVAL_*_VOCABs)
-    # You can pass these as arguments if they change, but usually they are static.
+    # Standard Vocabs matching the Evaluator defaults
     EVAL_SHOT_VOCAB = {'<pad>': 0, 'f': 1, 'b': 2, 'r': 3, 'v': 4, 'o': 5, 's': 6, 'u': 7, 'l': 8, 'm': 9, 'z': 10}
-    EVAL_DIR_VOCAB  = {'<pad>': 0, '0': 0, '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6}
+    EVAL_DIR_VOCAB  = {'<pad>': 0, '0': 0, '1': 1, '2': 2, '3': 3}
     EVAL_DEPTH_VOCAB = {'<pad>': 0, '0': 0, '7': 1, '8': 2, '9': 3}
     
     uni_map = {}
     serve_type_id = EVAL_SHOT_VOCAB.get('s', 6)
     
-    # 2. Iterate through the dataset's vocabulary
-    # Ensure we use the correct inverse vocab attribute
+    # Iterate through the dataset's vocabulary
     if hasattr(dataset, 'inv_unified_vocab'):
         inv_vocab = dataset.inv_unified_vocab
     else:
-        # Fallback if inverse dict isn't pre-built
         inv_vocab = {v: k for k, v in dataset.unified_vocab.items()}
 
     for uid, key in inv_vocab.items():
-        # A. Handle Padding / Unknowns (IDs 0 and 1)
         if uid <= 1: 
             uni_map[uid] = (0, 0, 0)
             continue
@@ -226,23 +260,16 @@ def get_universal_decoder_map(dataset):
         parts = key.split('_')
         token_type = parts[0]
         
-        # B. Handle Serves (e.g., "Serve_4")
-        if token_type == 'Serve' or token_type == 'S':
-            # Format: (ServeType, Direction, Depth=0)
-            d_str = parts[1] if len(parts) > 1 else '0'
-            uni_map[uid] = (
-                serve_type_id, 
-                EVAL_DIR_VOCAB.get(d_str, 0), 
-                0
-            )
+        # Handle Serves (e.g., "Serve_6")
+        if token_type == 'Serve':
+            uni_map[uid] = (serve_type_id, 0, 0) # Force Dir/Depth 0 for Serves to keep metric clean
             
-        # C. Handle Specials (e.g., "LET", "SPECIAL") -> Map to Padding (0)
+        # Handle Specials (e.g., "LET", "SPECIAL")
         elif token_type in ['LET', 'SPECIAL', 'PAD', 'UNK']:
             uni_map[uid] = (0, 0, 0)
             
-        # D. Handle Standard Shots (e.g., "f_2_8" or "b_1")
+        # Handle Standard Shots (e.g., "f_2_8_...")
         else:
-            # Safe parsing: use defaults if parts are missing
             t_str = parts[0]
             d_str = parts[1] if len(parts) > 1 else '0'
             dp_str = parts[2] if len(parts) > 2 else '0'
