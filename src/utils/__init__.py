@@ -282,8 +282,6 @@ __all__ = [
     'setup_logging',
     'save_checkpoint',
     'load_checkpoint',
-    'create_experiment_dir',
-    'ensure_directory_exists',
     'get_device',
     'set_seed'
 ]
